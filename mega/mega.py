@@ -38,7 +38,7 @@ class Mega(object):
         params = {'id': self.seqno}
         self.seqno += 1
         if self.sid:
-            params.update({'sid': self.sid})
+            params['sid'] = self.sid
         data = json.dumps([data])
         req = requests.post(
             'https://g.api.mega.co.nz/cs', params=params, data=data)
@@ -72,7 +72,7 @@ class Mega(object):
     def _login_common(self, res, password):
         if res in (-2, -9):
             raise MegaIncorrectPasswordExcetion("Incorrect e-mail and/or password.")
-            
+
         enc_master_key = base64_to_a32(res['k'])
         self.master_key = decrypt_key(enc_master_key, password)
         if 'tsid' in res:
@@ -101,7 +101,7 @@ class Mega(object):
                  self.rsa_priv_key[0],
                  self.rsa_priv_key[1]))
             sid = '%x' % decrypter.key._decrypt(enc_sid)
-            sid = binascii.unhexlify('0' + sid if len(sid) % 2 else sid)
+            sid = binascii.unhexlify(f'0{sid}' if len(sid) % 2 else sid)
             self.sid = base64urlencode(sid[:43])
 
     def get_files(self):
@@ -164,44 +164,41 @@ class Mega(object):
         infile = requests.get(file_url, stream=True).raw
         if store_path:
             file_name = os.path.join(store_path, file_name)
-        outfile = open(file_name, 'wb')
+        with open(file_name, 'wb') as outfile:
+            counter = Counter.new(
+                128, initial_value=((iv[0] << 32) + iv[1]) << 64)
+            decryptor = AES.new(a32_to_str(k), AES.MODE_CTR, counter=counter)
 
-        counter = Counter.new(
-            128, initial_value=((iv[0] << 32) + iv[1]) << 64)
-        decryptor = AES.new(a32_to_str(k), AES.MODE_CTR, counter=counter)
+            file_mac = (0, 0, 0, 0)
+            for chunk_start, chunk_size in sorted(get_chunks(file_size).items()):
+                chunk = infile.read(chunk_size)
+                chunk = decryptor.decrypt(chunk)
+                outfile.write(chunk)
 
-        file_mac = (0, 0, 0, 0)
-        for chunk_start, chunk_size in sorted(get_chunks(file_size).items()):
-            chunk = infile.read(chunk_size)
-            chunk = decryptor.decrypt(chunk)
-            outfile.write(chunk)
+                chunk_mac = [iv[0], iv[1], iv[0], iv[1]]
+                for i in range(0, len(chunk), 16):
+                    block = chunk[i:i+16]
+                    if len(block) % 16:
+                        block += b'\0' * (16 - (len(block) % 16))
+                    block = str_to_a32(block)
+                    chunk_mac = [
+                        chunk_mac[0] ^ block[0],
+                        chunk_mac[1] ^ block[1],
+                        chunk_mac[2] ^ block[2],
+                        chunk_mac[3] ^ block[3]]
+                    chunk_mac = aes_cbc_encrypt_a32(chunk_mac, k)
 
-            chunk_mac = [iv[0], iv[1], iv[0], iv[1]]
-            for i in range(0, len(chunk), 16):
-                block = chunk[i:i+16]
-                if len(block) % 16:
-                    block += b'\0' * (16 - (len(block) % 16))
-                block = str_to_a32(block)
-                chunk_mac = [
-                    chunk_mac[0] ^ block[0],
-                    chunk_mac[1] ^ block[1],
-                    chunk_mac[2] ^ block[2],
-                    chunk_mac[3] ^ block[3]]
-                chunk_mac = aes_cbc_encrypt_a32(chunk_mac, k)
-
-            file_mac = [
-                file_mac[0] ^ chunk_mac[0],
-                file_mac[1] ^ chunk_mac[1],
-                file_mac[2] ^ chunk_mac[2],
-                file_mac[3] ^ chunk_mac[3]]
-            file_mac = aes_cbc_encrypt_a32(file_mac, k)
-
-        outfile.close()
+                file_mac = [
+                    file_mac[0] ^ chunk_mac[0],
+                    file_mac[1] ^ chunk_mac[1],
+                    file_mac[2] ^ chunk_mac[2],
+                    file_mac[3] ^ chunk_mac[3]]
+                file_mac = aes_cbc_encrypt_a32(file_mac, k)
 
         # Integrity check
         if (file_mac[0] ^ file_mac[1], file_mac[2] ^ file_mac[3]) != meta_mac:
             raise ValueError('MAC mismatch')
-        
+
         return file_name
     
     def get_public_url(self, file_id, file_key):
@@ -212,54 +209,52 @@ class Mega(object):
     def uploadfile(self, filename, dst=None):
         if not dst:
             root_id = getattr(self, 'root_id', None)
-            if root_id == None:
+            if root_id is None:
                 self.get_files()
             dst = self.root_id
-        infile = open(filename, 'rb')
-        size = os.path.getsize(filename)
-        ul_url = self.api_req({'a': 'u', 's': size})['p']
+        with open(filename, 'rb') as infile:
+            size = os.path.getsize(filename)
+            ul_url = self.api_req({'a': 'u', 's': size})['p']
 
-        ul_key = [random.randint(0, 0xFFFFFFFF) for _ in range(6)]
-        counter = Counter.new(
-            128, initial_value=((ul_key[4] << 32) + ul_key[5]) << 64)
-        encryptor = AES.new(
-            a32_to_str(ul_key[:4]),
-            AES.MODE_CTR,
-            counter=counter)
+            ul_key = [random.randint(0, 0xFFFFFFFF) for _ in range(6)]
+            counter = Counter.new(
+                128, initial_value=((ul_key[4] << 32) + ul_key[5]) << 64)
+            encryptor = AES.new(
+                a32_to_str(ul_key[:4]),
+                AES.MODE_CTR,
+                counter=counter)
 
-        file_mac = [0, 0, 0, 0]
-        for chunk_start, chunk_size in sorted(get_chunks(size).items()):
-            chunk = infile.read(chunk_size)
+            file_mac = [0, 0, 0, 0]
+            for chunk_start, chunk_size in sorted(get_chunks(size).items()):
+                chunk = infile.read(chunk_size)
 
-            chunk_mac = [ul_key[4], ul_key[5], ul_key[4], ul_key[5]]
-            for i in range(0, len(chunk), 16):
-                block = chunk[i:i+16]
-                if len(block) % 16:
-                    block += b'\0' * (16 - len(block) % 16)
-                block = str_to_a32(block)
-                chunk_mac = [chunk_mac[0] ^ block[0],
-                             chunk_mac[1] ^ block[1],
-                             chunk_mac[2] ^ block[2],
-                             chunk_mac[3] ^ block[3]]
-                chunk_mac = aes_cbc_encrypt_a32(chunk_mac, ul_key[:4])
+                chunk_mac = [ul_key[4], ul_key[5], ul_key[4], ul_key[5]]
+                for i in range(0, len(chunk), 16):
+                    block = chunk[i:i+16]
+                    if len(block) % 16:
+                        block += b'\0' * (16 - len(block) % 16)
+                    block = str_to_a32(block)
+                    chunk_mac = [chunk_mac[0] ^ block[0],
+                                 chunk_mac[1] ^ block[1],
+                                 chunk_mac[2] ^ block[2],
+                                 chunk_mac[3] ^ block[3]]
+                    chunk_mac = aes_cbc_encrypt_a32(chunk_mac, ul_key[:4])
 
-            file_mac = [file_mac[0] ^ chunk_mac[0],
-                        file_mac[1] ^ chunk_mac[1],
-                        file_mac[2] ^ chunk_mac[2],
-                        file_mac[3] ^ chunk_mac[3]]
-            file_mac = aes_cbc_encrypt_a32(file_mac, ul_key[:4])
+                file_mac = [file_mac[0] ^ chunk_mac[0],
+                            file_mac[1] ^ chunk_mac[1],
+                            file_mac[2] ^ chunk_mac[2],
+                            file_mac[3] ^ chunk_mac[3]]
+                file_mac = aes_cbc_encrypt_a32(file_mac, ul_key[:4])
 
-            chunk = encryptor.encrypt(chunk)
-            url = '%s/%s' % (ul_url, str(chunk_start))
-            outfile = requests.post(url, data=chunk, stream=True).raw
+                chunk = encryptor.encrypt(chunk)
+                url = '%s/%s' % (ul_url, str(chunk_start))
+                outfile = requests.post(url, data=chunk, stream=True).raw
 
-            # assume utf-8 encoding. Maybe this entire section can be simplified
-            # by not looking at the raw output
-            # (http://docs.python-requests.org/en/master/user/advanced/#body-content-workflow)
+                # assume utf-8 encoding. Maybe this entire section can be simplified
+                # by not looking at the raw output
+                # (http://docs.python-requests.org/en/master/user/advanced/#body-content-workflow)
 
-            completion_handle = outfile.read().decode('utf-8')
-        infile.close()
-
+                completion_handle = outfile.read().decode('utf-8')
         meta_mac = (file_mac[0] ^ file_mac[1], file_mac[2] ^ file_mac[3])
 
         attributes = {'n': os.path.basename(filename)}
@@ -271,9 +266,8 @@ class Mega(object):
                ul_key[4], ul_key[5],
                meta_mac[0], meta_mac[1]]
         encrypted_key = a32_to_base64(encrypt_key(key, self.master_key))
-        data = self.api_req({'a': 'p', 't': dst, 'n': [
+        return self.api_req({'a': 'p', 't': dst, 'n': [
             {'h': completion_handle,
              't': 0,
              'a': enc_attributes,
              'k': encrypted_key}]})
-        return data

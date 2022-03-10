@@ -4,10 +4,4 @@
 def is_token(token):
     token = token.split()[-1]
     TLEN = len(token)
-    if TLEN == 62:
-        if token[1] == "/":
-            return True
-        else:
-            return False
-    else:
-        return False
+    return TLEN == 62 and token[1] == "/"
